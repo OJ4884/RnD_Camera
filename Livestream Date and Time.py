@@ -459,7 +459,45 @@ def frame_capture_thread():
             if prev_frame is None:
                 prev_frame = gray
                 continue
+            circles = cv2.HoughCircles(
+                gray,
+                cv2.HOUGH_GRADIENT,
+                dp=1.2,
+                minDist=30,
+                param1=50,
+                param2=15,
+                minRadius=5,
+                maxRadius=100
+            )
+            if circles is not None:
+                circles = np.uint16(np.around(circles))
 
+                for (x, y, r) in circles[0, :]:
+                    cv2.circle(
+                        frame,
+                        (x + x_offset, y + y_offset),
+                        r,
+                        (0, 255, 0),
+                        2
+                    )
+                    cv2.circle(
+                        frame,
+                        (x + x_offset, y + y_offset),
+                        2,
+                        (0, 0, 255), 3)
+                    cv2.putText(frame, "BUBBLES DETECTED",
+                                (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                1,
+                                (0, 255, 255),
+                                2)
+                    cv2.rectangle(
+                        frame,
+                        (x + x_offset - 5, y + y_offset - 5),
+                        (x + x_offset + 5, y + y_offset + 5),
+                        (255, 0, 255),
+                        -1
+                    )
             frame_delta = cv2.absdiff(prev_frame, gray)
             prev_frame = gray
 

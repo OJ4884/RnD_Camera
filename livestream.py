@@ -2,30 +2,26 @@
 """
 Raspberry Pi 5 Camera Livestream Server
 Single-bubble pipe-locked tracker:
-- only acquires a bubble at the pipe mouth
+- only acquires a new bubble at the pipe mouth
 - tracks one bubble at a time
-- counts once when that bubble disappears after moving upward
+- ignores random side detections
+- counts once only after the bubble moves upward and disappears
 """
 
 import io
-import json
 import threading
 import logging
 import time
-from pathlib import Path
+import numpy as np
+import cv2
 
 from datetime import datetime
 from flask import Flask, render_template_string, Response, jsonify
 
-output = None
-cv2 = None
-np = None
-Picamera2 = None
-PROFILE_PATH = None
-
 # =========================
 # GLOBAL STATE / TUNING
 # =========================
+output = None
 camera = None
 streaming = False
 recording = False
@@ -44,7 +40,7 @@ ROI_Y1 = 140
 ROI_X2 = 760
 ROI_Y2 = 500
 
-# Pipe geometry - matched to your working test-video logic
+# Pipe geometry
 PIPE_CENTER_X_BIAS = -50
 PIPE_WIDTH_RATIO = 0.35
 PIPE_LOCK_WIDTH_RATIO = 0.18
@@ -66,41 +62,14 @@ MAX_RADIUS = 20
 
 # Acquisition band: only start a new bubble near pipe mouth
 SPAWN_BAND_HALF = 22
+
+# Visual / logic band
 COUNT_BAND_HALF = 12
 
 # Debug
 DEBUG_DRAW = True
 
 frame_lock = threading.Lock()
-
-SHARED_PROFILE_FIELDS = {
-    "pipe_center_x_bias": "PIPE_CENTER_X_BIAS",
-    "pipe_width_ratio": "PIPE_WIDTH_RATIO",
-    "pipe_lock_width_ratio": "PIPE_LOCK_WIDTH_RATIO",
-    "pipe_top_ratio": "PIPE_TOP_RATIO",
-    "pipe_bottom_ratio": "PIPE_BOTTOM_RATIO",
-    "pipe_exit_ratio": "PIPE_EXIT_RATIO",
-    "count_band_half": "COUNT_BAND_HALF",
-}
-
-LIVESTREAM_PROFILE_FIELDS = {
-    "target_fps": "TARGET_FPS",
-    "roi_x1": "ROI_X1",
-    "roi_y1": "ROI_Y1",
-    "roi_x2": "ROI_X2",
-    "roi_y2": "ROI_Y2",
-    "lock_after_frames": "LOCK_AFTER_FRAMES",
-    "lost_after_frames": "LOST_AFTER_FRAMES",
-    "min_upward_travel": "MIN_UPWARD_TRAVEL",
-    "max_match_distance": "MAX_MATCH_DISTANCE",
-    "downward_tolerance": "DOWNWARD_TOLERANCE",
-    "detect_interval": "DETECT_INTERVAL",
-    "min_radius": "MIN_RADIUS",
-    "max_radius": "MAX_RADIUS",
-    "spawn_band_half": "SPAWN_BAND_HALF",
-    "count_band_half": "COUNT_BAND_HALF",
-    "debug_draw": "DEBUG_DRAW",
-}
 
 
 class StreamingOutput(io.BufferedIOBase):
@@ -112,6 +81,13 @@ class StreamingOutput(io.BufferedIOBase):
         with self.condition:
             self.frame = buf
             self.condition.notify_all()
+
+
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    print("Error: picamera2 is not installed")
+    raise SystemExit(1)
 
 
 logging.basicConfig(
@@ -380,66 +356,10 @@ def distance(p1, p2):
     return float(np.hypot(p1[0] - p2[0], p1[1] - p2[1]))
 
 
-def validate_profile_path(profile_path):
-    resolved_path = Path(profile_path)
-    if not resolved_path.is_file():
-        raise SystemExit(f"Profile file not found: {profile_path}")
-    return str(resolved_path)
-
-
-def load_profile_data(profile_path):
-    with open(profile_path, "r", encoding="utf-8") as profile_file:
-        data = json.load(profile_file)
-
-    if not isinstance(data, dict):
-        raise SystemExit(f"Profile must be a JSON object: {profile_path}")
-
-    return data
-
-
-def apply_profile_mapping(profile_section, mapping):
-    if not isinstance(profile_section, dict):
-        return
-
-    for key, global_name in mapping.items():
-        if key in profile_section:
-            globals()[global_name] = profile_section[key]
-
-
-def apply_livestream_profile(profile_path):
-    global PROFILE_PATH
-
-    PROFILE_PATH = validate_profile_path(profile_path)
-    profile_data = load_profile_data(PROFILE_PATH)
-
-    apply_profile_mapping(profile_data.get("shared", {}), SHARED_PROFILE_FIELDS)
-    apply_profile_mapping(profile_data.get("livestream", {}), LIVESTREAM_PROFILE_FIELDS)
-
-
-def load_runtime_dependencies(require_camera=True):
-    global cv2, np, Picamera2
-
-    if np is None:
-        import numpy as np_module
-        np = np_module
-
-    if cv2 is None:
-        import cv2 as cv2_module
-        cv2 = cv2_module
-
-    if require_camera and Picamera2 is None:
-        try:
-            from picamera2 import Picamera2 as picamera2_class
-        except ImportError:
-            print("Error: picamera2 is not installed")
-            raise SystemExit(1)
-        Picamera2 = picamera2_class
-
-
 def detect_bubbles(small_gray, scale_x, scale_y, x_offset, y_offset):
     """
     Detect circles in the reduced ROI and map center back to full-frame coordinates.
-    Radius is kept as RAW Hough radius to avoid over-scaling problems.
+    Radius is kept as raw Hough radius.
     """
     small_gray = cv2.GaussianBlur(small_gray, (5, 5), 0)
 
@@ -474,13 +394,6 @@ def detect_bubbles(small_gray, scale_x, scale_y, x_offset, y_offset):
 
 
 def frame_capture_thread():
-    """
-    One-bubble-at-a-time logic:
-    1. Only acquire a new bubble near the pipe mouth.
-    2. Track only that bubble.
-    3. Ignore all other detections.
-    4. Count only when it disappears after moving upward enough.
-    """
     global active_bubble, next_bubble_id, bubble_count_total, bubble_history
 
     frame_count = 0
@@ -511,7 +424,6 @@ def frame_capture_thread():
             if frame_count < 10:
                 continue
 
-            # ROI
             x1, y1, x2, y2 = ROI_X1, ROI_Y1, ROI_X2, ROI_Y2
             x1 = max(0, x1)
             y1 = max(0, y1)
@@ -533,7 +445,6 @@ def frame_capture_thread():
             small = cv2.resize(blur, (64, 48), interpolation=cv2.INTER_AREA)
             small = cv2.equalizeHist(small)
 
-            # Pipe geometry
             pipe_center_x = x_offset + (roi_w // 2) + PIPE_CENTER_X_BIAS
             pipe_width = int(roi_w * PIPE_WIDTH_RATIO)
             pipe_lock_width = int(roi_w * PIPE_LOCK_WIDTH_RATIO)
@@ -541,20 +452,16 @@ def frame_capture_thread():
             pipe_bottom = y_offset + int(roi_h * PIPE_BOTTOM_RATIO)
             pipe_exit_y = y_offset + int(roi_h * PIPE_EXIT_RATIO)
 
-            # Spawn band: new bubble must appear here
             spawn_y1 = pipe_exit_y - SPAWN_BAND_HALF
             spawn_y2 = pipe_exit_y + SPAWN_BAND_HALF
 
-            # A higher band just for visual reference
             count_y1 = pipe_exit_y - COUNT_BAND_HALF - 30
             count_y2 = pipe_exit_y + COUNT_BAND_HALF - 30
 
             if DEBUG_DRAW:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                cv2.putText(
-                    frame, "ROI", (x1, y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1
-                )
+                cv2.putText(frame, "ROI", (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
                 cv2.line(frame, (pipe_center_x, y1), (pipe_center_x, y2), (255, 255, 0), 2)
                 cv2.rectangle(
@@ -570,15 +477,11 @@ def frame_capture_thread():
                     (0, 255, 255), 1
                 )
                 cv2.rectangle(frame, (x1, spawn_y1), (x2, spawn_y2), (0, 165, 255), 1)
-                cv2.putText(
-                    frame, "SPAWN BAND", (x1, spawn_y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1
-                )
+                cv2.putText(frame, "SPAWN BAND", (x1, spawn_y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
                 cv2.rectangle(frame, (x1, count_y1), (x2, count_y2), (0, 0, 255), 1)
-                cv2.putText(
-                    frame, "UPWARD CHECK", (x1, count_y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1
-                )
+                cv2.putText(frame, "UPWARD CHECK", (x1, count_y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
             detections = []
 
@@ -592,35 +495,29 @@ def frame_capture_thread():
                 )
                 last_detect_time = time.time()
 
-                # First filter: radius
                 filtered = [
                     (cx, cy, r)
                     for (cx, cy, r) in raw_detections
                     if MIN_RADIUS <= r <= MAX_RADIUS
                 ]
 
-                # Second filter: inside pipe lock zone
                 filtered = [
                     (cx, cy, r)
                     for (cx, cy, r) in filtered
                     if abs(cx - pipe_center_x) <= pipe_lock_width and pipe_top <= cy <= pipe_bottom
                 ]
 
-                # Third filter: if no active bubble, ONLY accept detections at pipe mouth
                 if active_bubble is None:
                     filtered = [
                         (cx, cy, r)
                         for (cx, cy, r) in filtered
                         if spawn_y1 <= cy <= spawn_y2
                     ]
-
-                    # Prefer biggest / most centered object at the mouth
                     filtered = sorted(
                         filtered,
                         key=lambda d: (abs(d[0] - pipe_center_x), -d[2])
                     )
                 else:
-                    # During tracking, prefer nearest detection to current bubble
                     filtered = sorted(
                         filtered,
                         key=lambda d: distance((d[0], d[1]), (active_bubble["cx"], active_bubble["cy"]))
@@ -638,9 +535,6 @@ def frame_capture_thread():
 
             now = time.time()
 
-            # =========================
-            # ACQUIRE OR UPDATE ONE BUBBLE
-            # =========================
             if active_bubble is None:
                 if detections:
                     cx, cy, r = detections[0]
@@ -665,7 +559,6 @@ def frame_capture_thread():
                 for det in detections:
                     cx, cy, r = det
 
-                    # Reject detections that jump too far downward
                     if cy > active_bubble["cy"] + DOWNWARD_TOLERANCE:
                         continue
 
@@ -686,9 +579,6 @@ def frame_capture_thread():
                 else:
                     active_bubble["lost_frames"] += 1
 
-            # =========================
-            # COUNT WHEN DISAPPEARED
-            # =========================
             if active_bubble is not None and active_bubble["lost_frames"] >= LOST_AFTER_FRAMES:
                 traveled_up = active_bubble["start_y"] - active_bubble["min_y"]
 
@@ -722,9 +612,6 @@ def frame_capture_thread():
                 print(f"ENDED bubble {active_bubble['id']} counted={should_count}")
                 active_bubble = None
 
-            # =========================
-            # DRAW ACTIVE BUBBLE
-            # =========================
             if active_bubble is not None:
                 cx = active_bubble["cx"]
                 cy = active_bubble["cy"]
@@ -738,7 +625,6 @@ def frame_capture_thread():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1
                 )
 
-            # Overlay
             fps = min(30, 1.0 / max(time.time() - start_time, 1e-6))
 
             overlay = frame.copy()
@@ -790,7 +676,6 @@ def initialize_camera(resolution=(960, 540), fps=30):
     global camera, streaming, output
 
     try:
-        load_runtime_dependencies(require_camera=True)
         logger.info("Initializing camera...")
         camera = Picamera2()
 
@@ -876,18 +761,11 @@ if __name__ == "__main__":
     parser.add_argument("-H", "--host", type=str, default="127.0.0.1")
     parser.add_argument("-r", "--resolution", type=int, nargs=2, default=[960, 540])
     parser.add_argument("-f", "--fps", type=int, default=30)
-    parser.add_argument(
-        "--profile",
-        help="Profile file to load for live camera tuning overrides",
-    )
     args = parser.parse_args()
 
     atexit.register(cleanup_camera)
 
     try:
-        if args.profile:
-            apply_livestream_profile(args.profile)
-
         if initialize_camera(tuple(args.resolution), args.fps):
             logger.info("Starting livestream server on http://%s:%s", args.host, args.port)
             app.run(
