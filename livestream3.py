@@ -763,38 +763,6 @@ def frame_capture_thread():
                     1
                 )
 
-            fps = min(30, 1.0 / max(time.time() - start_time, 1e-6))
-
-            overlay = frame.copy()
-            box_width = 320
-            box_height = 175
-            ox1 = frame.shape[1] - box_width - 10
-            oy1 = 10
-            ox2 = frame.shape[1] - 10
-            oy2 = oy1 + box_height
-            cv2.rectangle(overlay, (ox1, oy1), (ox2, oy2), (0, 0, 0), -1)
-            frame = cv2.addWeighted(overlay, 0.5, frame, 0.5, 0)
-
-            y = oy1 + 22
-            line_height = 20
-            texts = [
-                f"FPS: {fps:.1f}",
-                f"Frame: {frame_count}",
-                f"Tracking: {1 if active_bubble is not None else 0}",
-                f"Candidate: {1 if candidate_bubble is not None else 0}",
-                f"Count: {bubble_count_total}",
-                f"Source: {source_label[:26]}",
-                f"Pipe bias: {PIPE_CENTER_X_BIAS}",
-                f"Mouth lock: {pipe_mouth_lock_width}",
-            ]
-
-            for text in texts:
-                cv2.putText(
-                    frame, text, (ox1 + 10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2
-                )
-                y += line_height
-
             ret, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 45])
             if ret:
                 with output.condition:

@@ -62,3 +62,10 @@ deactivate
 ''''bash
 deactivate
 
+10. Git commands to be run inside the pi not the venv
+'''bash git add .
+git commit -m "message"
+git push origin main
+
+11. Personal Github Access Token
+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/ RnD_Camera_Pi

@@ -33,13 +33,23 @@ def normalize_video(input_path: Path, force: bool) -> Path:
             "Use --force to overwrite it."
         )
 
+    # Preserve the full camera frame while normalizing to a stable canvas size.
+    # The previous fixed scale filter forced every input into 1280x720, which can
+    # look like an in-camera zoom/crop on non-16:9 sources from the prototype set.
+    video_filter = (
+        f"fps={DEFAULT_FPS},"
+        f"scale={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos,"
+        f"pad={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
+        "setsar=1"
+    )
+
     cmd = [
         "ffmpeg",
         "-y" if force else "-n",
         "-i",
         str(input_path),
         "-vf",
-        f"fps={DEFAULT_FPS},scale={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:flags=lanczos",
+        video_filter,
         "-c:v",
         "libx264",
         "-preset",

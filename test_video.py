@@ -10,7 +10,8 @@ from flask import Flask, Response, jsonify, render_template_string
 
 from livestream import detect_bubbles
 
-VIDEO_PATH = "Bubbles2.mp4"
+DATASET_DIR = Path("Prototype Dataset 1")
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi"}
 LOG_PATH = "bubble_log.jsonl"
 TARGET_FPS = 20
 DETECT_EVERY_SECONDS = 0.10
@@ -35,7 +36,21 @@ SPAWN_BAND_HALF = 22
 DEBUG_DRAW = True
 
 app = Flask(__name__)
-cap = cv2.VideoCapture(VIDEO_PATH)
+
+
+def _load_dataset_videos():
+    if not DATASET_DIR.exists():
+        raise FileNotFoundError(f"Dataset directory not found: {DATASET_DIR}")
+    videos = [p for p in sorted(DATASET_DIR.iterdir()) if p.suffix.lower() in VIDEO_EXTENSIONS]
+    if not videos:
+        raise FileNotFoundError(f"No dataset videos found in {DATASET_DIR}")
+    return videos
+
+
+DATASET_VIDEOS = _load_dataset_videos()
+current_video_index = 0
+current_video_path = DATASET_VIDEOS[current_video_index]
+cap = cv2.VideoCapture(str(current_video_path))
 
 active_bubble = None
 candidate_bubble = None
@@ -95,6 +110,7 @@ def promote_candidate_to_active(candidate, now, bubble_id):
 def generate_frames():
     global cap, active_bubble, candidate_bubble, bubble_history
     global next_bubble_id, bubble_count_total, last_detect_time
+    global current_video_index, current_video_path
 
     frame_count = 0
     frame_interval = 1.0 / TARGET_FPS
@@ -103,7 +119,10 @@ def generate_frames():
         start = time.time()
         ret, frame = cap.read()
         if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            current_video_index = (current_video_index + 1) % len(DATASET_VIDEOS)
+            current_video_path = DATASET_VIDEOS[current_video_index]
+            cap.release()
+            cap = cv2.VideoCapture(str(current_video_path))
             active_bubble = None
             candidate_bubble = None
             continue
@@ -256,7 +275,7 @@ def status():
             "active_bubble": active_bubble is not None,
             "candidate_bubble": candidate_bubble is not None,
             "auto_center": False,
-            "video": Path(VIDEO_PATH).name,
+            "video": current_video_path.name,
         }
     )
 
@@ -269,4 +288,4 @@ if __name__ == "__main__":
             cap.release()
 
     atexit.register(_cleanup)
-    app.run(host="0.0.0.0", port=5001, threaded=True)
+    app.run(host="0.0.0.0", port=5002, threaded=True)
